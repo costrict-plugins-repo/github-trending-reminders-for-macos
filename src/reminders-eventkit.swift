@@ -1,0 +1,1364 @@
+// Copyright (c) 2026 high5 ventures GmbH
+// SPDX-License-Identifier: MIT
+//
+// reminders-eventkit.swift
+//
+// A small, self-contained CLI wrapper around Apple's EventKit framework that
+// exposes CRUD operations and smart queries for macOS Reminders. It is used
+// by the `apple-reminders` Claude skill as a fast, structured alternative to
+// AppleScript (EventKit is indexed, AppleScript scans linearly).
+//
+// Build:
+//   ./build.sh binary
+//
+// A bare `swiftc` call is not enough: build.sh pins the deployment target,
+// builds arm64 and x86_64 into one universal binary, and links the Info.plist
+// that macOS needs before it will grant Reminders access.
+//
+// Usage:
+//   reminders-eventkit <command> [args...]
+//
+// Commands (all arguments are positional JSON strings when they contain
+// structured data; simple scalars are plain):
+//
+//   list-lists
+//   get-list-info     <list-name>
+//   list-reminders    <list-name> <filter:open|completed|all>
+//   search-reminders  <query> <filter:open|completed|all> <limit:int>
+//   get-today
+//   get-overdue
+//   get-scheduled
+//   get-reminder      <id>
+//   create-reminder   <json-payload>
+//   update-reminder   <json-payload>
+//   complete-reminder <id>
+//   uncomplete-reminder <id>
+//   delete-reminder   <id>
+//
+// JSON payloads for create/update use this shape (all fields optional except
+// where noted):
+//
+//   create:
+//     { "list": "Groceries",      // required; exact title or "id:<calendar_identifier>"
+//       "title": "Buy milk",      // required
+//       "body": "organic, 1.5l",
+//       "dueDate": "2026-04-11T18:00:00",  // ISO-8601 local or with offset,
+//                                          // or "2026-04-11" for a date without a time
+//       "priority": 5,            // 0|1|5|9
+//       "recurrence": { "frequency": "weekly", "daysOfWeek": ["monday"] } }
+//                                 // needs a dueDate; see parseRecurrence
+//
+//   update:
+//     { "id": "UUID",             // required
+//       "title": "...",
+//       "body": "...",
+//       "dueDate": "...",
+//       "clearDueDate": true,     // explicit wipe
+//       "priority": 5,
+//       "recurrence": { ... },    // replaces the repeat rule
+//       "clearRecurrence": true } // stops the reminder repeating
+//
+// There is no `flagged` field: EventKit does not expose the flag (see the note
+// below reminderDict).
+//
+// Every invocation prints exactly one line of JSON to stdout:
+//
+//   {"status":"ok","data": <payload>}
+//   {"status":"error","code":"<TOKEN>","message":"<text>"}
+//
+// Exit code is 0 for "ok", 1 for "error". The wrapper never writes to stderr
+// on its happy path; unexpected crashes land in stderr with a Swift backtrace.
+
+import Foundation
+import EventKit
+import MachO
+
+// MARK: - JSON helpers ------------------------------------------------------
+
+/// Minimal JSON encoder that uses Foundation's JSONSerialization but wraps it
+/// in a stable shape and handles ISO-8601 dates ourselves because
+/// JSONSerialization cannot encode Dates.
+
+enum Json {
+    /// Encode `Any`-typed value tree to a compact JSON string.
+    static func encode(_ value: Any) -> String {
+        do {
+            let data = try JSONSerialization.data(
+                withJSONObject: value,
+                options: [.withoutEscapingSlashes]
+            )
+            return String(data: data, encoding: .utf8) ?? "null"
+        } catch {
+            return "null"
+        }
+    }
+
+    static func ok(_ payload: Any) -> String {
+        return encode(["status": "ok", "data": payload])
+    }
+
+    static func err(code: String, message: String) -> String {
+        return encode(["status": "error", "code": code, "message": message])
+    }
+
+    /// Error variant with extra structured fields (e.g. `candidates` for
+    /// `LIST_AMBIGUOUS`). Consumers should treat any unknown top-level
+    /// keys as additional diagnostic information.
+    static func errWith(code: String, message: String, extra: [String: Any]) -> String {
+        var dict: [String: Any] = [
+            "status": "error",
+            "code": code,
+            "message": message,
+        ]
+        for (k, v) in extra { dict[k] = v }
+        return encode(dict)
+    }
+}
+
+// MARK: - stdin helper ------------------------------------------------------
+
+/// Read all of stdin as a UTF-8 string. Used to accept JSON payloads via a
+/// pipe so callers can avoid shell-quoting pitfalls with payloads that
+/// contain apostrophes, backticks, `$(...)`, or other characters that are
+/// awkward to escape inside a positional argv entry.
+func readStdinAsString() -> String {
+    var buffer = Data()
+    let input = FileHandle.standardInput
+    while true {
+        let chunk = input.availableData
+        if chunk.isEmpty { break }
+        buffer.append(chunk)
+    }
+    return String(data: buffer, encoding: .utf8) ?? ""
+}
+
+/// Stable ISO-8601 formatter (local time zone, seconds precision, no TZ
+/// suffix to match the AppleScript reference implementation).
+let isoFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone.current
+    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+    return f
+}()
+
+/// Parser that accepts either the local format above OR a full ISO-8601 with
+/// TZ offset, for flexibility on input.
+func parseDate(_ s: String) -> Date? {
+    if let d = isoFormatter.date(from: s) { return d }
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let d = iso.date(from: s) { return d }
+    iso.formatOptions = [.withInternetDateTime]
+    return iso.date(from: s)
+}
+
+/// EventKit requires due date components in the Gregorian calendar, whatever
+/// calendar the user has picked in System Settings.
+let gregorian: Calendar = {
+    var c = Calendar(identifier: .gregorian)
+    c.timeZone = TimeZone.current
+    return c
+}()
+
+/// A due date as the create and update payloads give it: a point in time, or
+/// a day without a time. A day without a time is what the Reminders app
+/// creates when "Time" is off: due date components with no hour, minute or
+/// second, and no alert.
+enum DueDate {
+    case time(Date)
+    case day(DateComponents)
+}
+
+/// Parse a payload `dueDate`. `YYYY-MM-DD` is a day without a time; anything
+/// `parseDate` accepts is a point in time. Rejects days that do not exist,
+/// such as 2026-02-30, instead of rolling them over into the next month.
+func parseDueDate(_ s: String) -> DueDate? {
+    if s.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil {
+        let parts = s.split(separator: "-").compactMap { Int($0) }
+        var comps = DateComponents(year: parts[0], month: parts[1], day: parts[2])
+        guard let d = gregorian.date(from: comps) else { return nil }
+        let back = gregorian.dateComponents([.year, .month, .day], from: d)
+        guard back.year == comps.year, back.month == comps.month, back.day == comps.day
+        else { return nil }
+        comps.calendar = gregorian
+        return .day(comps)
+    }
+    return parseDate(s).map(DueDate.time)
+}
+
+/// The due date components of a day without a time, or nil for a due date
+/// with a time or no due date.
+func dueDay(_ dc: DateComponents?) -> DateComponents? {
+    guard let dc = dc, dc.hour == nil,
+          dc.year != nil, dc.month != nil, dc.day != nil
+    else { return nil }
+    return dc
+}
+
+/// Where a due date lies relative to today in the local time zone. Classified
+/// here rather than through the date range of
+/// `predicateForIncompleteReminders`, which missed reminders without a time
+/// that are due today (#26).
+enum DueRelativeToToday {
+    case before, today, after
+}
+
+func dueRelativeToToday(_ dc: DateComponents?, now: Date) -> DueRelativeToToday? {
+    let startOfToday = gregorian.startOfDay(for: now)
+    let startOfTomorrow = gregorian.date(byAdding: .day, value: 1, to: startOfToday)!
+    let due: Date
+    if let day = dueDay(dc) {
+        // A day without a time is a local calendar day, whatever time zone
+        // the components carry.
+        guard let d = gregorian.date(
+            from: DateComponents(year: day.year, month: day.month, day: day.day)
+        ) else { return nil }
+        due = d
+    } else if let dc = dc, let d = gregorian.date(from: dc) {
+        due = d
+    } else {
+        return nil
+    }
+    if due < startOfToday { return .before }
+    if due < startOfTomorrow { return .today }
+    return .after
+}
+
+/// Set a parsed due date. A point in time also gets an alert at that time; a
+/// day without a time gets none, like one made in the Reminders app.
+func setDueDate(_ r: EKReminder, _ due: DueDate) {
+    switch due {
+    case .time(let d):
+        r.dueDateComponents = gregorian.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: d
+        )
+        r.addAlarm(EKAlarm(absoluteDate: d))
+    case .day(let comps):
+        r.dueDateComponents = comps
+    }
+}
+
+func invalidDueDateMessage(_ s: String) -> String {
+    return "Could not parse dueDate '\(s)'. Use ISO-8601 local time like 2026-04-11T18:00:00, with offset like 2026-04-11T18:00:00+02:00, or a date without a time like 2026-04-11."
+}
+
+// MARK: - Recurrence --------------------------------------------------------
+
+/// An integer from a JSON payload. JSONSerialization hands numbers and
+/// booleans over as NSNumber, and `as? Int` would read `true` as 1.
+func jsonInt(_ value: Any?) -> Int? {
+    guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID()
+    else { return nil }
+    let i = n.intValue
+    return Double(i) == n.doubleValue ? i : nil
+}
+
+/// Index + 1 is the EKWeekday raw value (Sunday = 1).
+let weekdayNames = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+
+let frequencyNames: [(String, EKRecurrenceFrequency)] = [
+    ("daily", .daily), ("weekly", .weekly), ("monthly", .monthly), ("yearly", .yearly),
+]
+
+func frequencyName(_ f: EKRecurrenceFrequency) -> String {
+    return frequencyNames.first(where: { $0.1 == f })?.0 ?? "unknown"
+}
+
+/// The integer lists of a repeat rule: payload key, the largest value, whether
+/// values may count back from the end (-1 = last), and the frequencies the
+/// list is valid for. Ranges and frequencies are those Apple documents for
+/// EKRecurrenceRule's initializer, which does not check them itself.
+let recurrenceIntLists: [(key: String, limit: Int, signed: Bool, frequencies: [EKRecurrenceFrequency])] = [
+    ("daysOfMonth", 31, true, [.monthly]),
+    ("monthsOfYear", 12, false, [.yearly]),
+    ("weeksOfYear", 53, true, [.yearly]),
+    ("daysOfYear", 366, true, [.yearly]),
+    ("setPositions", 366, true, [.daily, .weekly, .monthly, .yearly]),
+]
+
+let recurrenceKeys: Set<String> = Set(
+    ["frequency", "interval", "daysOfWeek", "end"] + recurrenceIntLists.map { $0.key }
+)
+
+enum RecurrenceParse {
+    case rule(EKRecurrenceRule)
+    case invalid(String)
+}
+
+/// Parse a payload `recurrence` into a repeat rule. The object mirrors
+/// EKRecurrenceRule, and `recurrenceDict` reports a rule in the same shape,
+/// so a rule read from one reminder can be passed back unchanged:
+///
+///   { "frequency": "daily" | "weekly" | "monthly" | "yearly",  // required
+///     "interval": 2,                    // every 2 units, default 1
+///     "daysOfWeek": ["monday", {"day": "friday", "week": -1}],
+///                                       // week: nth weekday of the month or
+///                                       // year, -1 = last; monthly/yearly only
+///     "daysOfMonth": [1, -1],           // monthly
+///     "monthsOfYear": [3, 9],           // yearly
+///     "weeksOfYear": [1], "daysOfYear": [100],  // yearly
+///     "setPositions": [-1],             // keeps the nth of the days the other
+///                                       // lists produce, -1 = the last one
+///     "end": { "date": "2026-12-31" } | { "count": 10 } }
+///
+/// An end date without a time includes that whole day. Unknown keys are
+/// refused: a misspelled one would otherwise save a different rule than the
+/// caller asked for.
+func parseRecurrence(_ raw: Any) -> RecurrenceParse {
+    guard let obj = raw as? [String: Any] else {
+        return .invalid("recurrence must be an object.")
+    }
+    if let unknown = obj.keys.filter({ !recurrenceKeys.contains($0) }).sorted().first {
+        return .invalid("Unknown recurrence field '\(unknown)'. Allowed: \(recurrenceKeys.sorted().joined(separator: ", ")).")
+    }
+
+    guard let freqName = obj["frequency"] as? String,
+          let frequency = frequencyNames.first(where: { $0.0 == freqName })?.1
+    else {
+        return .invalid("recurrence.frequency must be one of daily, weekly, monthly, yearly.")
+    }
+
+    var interval = 1
+    if let rawInterval = obj["interval"] {
+        guard let i = jsonInt(rawInterval), i >= 1 else {
+            return .invalid("recurrence.interval must be an integer of at least 1.")
+        }
+        interval = i
+    }
+
+    var days: [EKRecurrenceDayOfWeek]? = nil
+    if let rawDays = obj["daysOfWeek"] {
+        guard let items = rawDays as? [Any] else {
+            return .invalid("recurrence.daysOfWeek must be an array.")
+        }
+        if !items.isEmpty && frequency == .daily {
+            return .invalid("recurrence.daysOfWeek needs frequency weekly, monthly or yearly.")
+        }
+        // The nth weekday counts within the month or the year.
+        let weekLimit = frequency == .monthly ? 5 : frequency == .yearly ? 53 : 0
+        var parsed: [EKRecurrenceDayOfWeek] = []
+        for item in items {
+            var name: String?
+            var week = 0
+            if let s = item as? String {
+                name = s
+            } else if let o = item as? [String: Any] {
+                if let unknown = o.keys.filter({ $0 != "day" && $0 != "week" }).sorted().first {
+                    return .invalid("Unknown recurrence.daysOfWeek field '\(unknown)'. Allowed: day, week.")
+                }
+                name = o["day"] as? String
+                if let rawWeek = o["week"] {
+                    guard let w = jsonInt(rawWeek) else {
+                        return .invalid("recurrence.daysOfWeek week must be an integer.")
+                    }
+                    week = w
+                }
+            }
+            guard let n = name?.lowercased(), let index = weekdayNames.firstIndex(of: n),
+                  let weekday = EKWeekday(rawValue: index + 1)
+            else {
+                return .invalid("recurrence.daysOfWeek takes weekday names (\(weekdayNames.joined(separator: ", "))) or objects like {\"day\": \"friday\", \"week\": -1}.")
+            }
+            if week != 0 && (weekLimit == 0 || abs(week) > weekLimit) {
+                return .invalid(weekLimit == 0
+                    ? "recurrence.daysOfWeek week needs frequency monthly or yearly."
+                    : "recurrence.daysOfWeek week must be 1 to \(weekLimit) or -1 to -\(weekLimit) for frequency \(freqName).")
+            }
+            parsed.append(week == 0
+                ? EKRecurrenceDayOfWeek(weekday)
+                : EKRecurrenceDayOfWeek(weekday, weekNumber: week))
+        }
+        if !parsed.isEmpty { days = parsed }
+    }
+
+    var lists: [String: [NSNumber]] = [:]
+    for spec in recurrenceIntLists {
+        guard let rawList = obj[spec.key] else { continue }
+        guard let items = rawList as? [Any] else {
+            return .invalid("recurrence.\(spec.key) must be an array of integers.")
+        }
+        if items.isEmpty { continue }
+        if !spec.frequencies.contains(frequency) {
+            let allowed = spec.frequencies.map(frequencyName).joined(separator: " or ")
+            return .invalid("recurrence.\(spec.key) needs frequency \(allowed).")
+        }
+        var values: [NSNumber] = []
+        for item in items {
+            guard let v = jsonInt(item), v != 0, abs(v) <= spec.limit, spec.signed || v > 0 else {
+                let range = spec.signed ? "1 to \(spec.limit) or -1 to -\(spec.limit)" : "1 to \(spec.limit)"
+                return .invalid("recurrence.\(spec.key) values must be integers from \(range).")
+            }
+            values.append(NSNumber(value: v))
+        }
+        lists[spec.key] = values
+    }
+    // A set position picks from the days the other lists produce; alone it
+    // selects nothing (RFC 5545, BYSETPOS).
+    if lists["setPositions"] != nil && days == nil && lists.count == 1 {
+        return .invalid("recurrence.setPositions needs daysOfWeek, daysOfMonth, monthsOfYear, weeksOfYear or daysOfYear.")
+    }
+
+    var end: EKRecurrenceEnd? = nil
+    if let rawEnd = obj["end"] {
+        guard let e = rawEnd as? [String: Any], e.count == 1 else {
+            return .invalid("recurrence.end must be {\"date\": \"2026-12-31\"} or {\"count\": 10}.")
+        }
+        if let rawCount = e["count"] {
+            guard let count = jsonInt(rawCount), count >= 1 else {
+                return .invalid("recurrence.end.count must be an integer of at least 1.")
+            }
+            end = EKRecurrenceEnd(occurrenceCount: count)
+        } else if let dateString = e["date"] as? String {
+            switch parseDueDate(dateString) {
+            case .time(let d)?:
+                end = EKRecurrenceEnd(end: d)
+            case .day(let comps)?:
+                // The last second of that day, so a reminder due on it at any
+                // time still repeats one last time.
+                let start = gregorian.date(
+                    from: DateComponents(year: comps.year, month: comps.month, day: comps.day)
+                )!
+                let next = gregorian.date(byAdding: .day, value: 1, to: start)!
+                end = EKRecurrenceEnd(end: next.addingTimeInterval(-1))
+            case nil:
+                return .invalid("Could not parse recurrence.end.date '\(dateString)'. Use a date like 2026-12-31 or a local time like 2026-12-31T18:00:00.")
+            }
+        } else {
+            return .invalid("recurrence.end must be {\"date\": \"2026-12-31\"} or {\"count\": 10}.")
+        }
+    }
+
+    return .rule(EKRecurrenceRule(
+        recurrenceWith: frequency,
+        interval: interval,
+        daysOfTheWeek: days,
+        daysOfTheMonth: lists["daysOfMonth"],
+        monthsOfTheYear: lists["monthsOfYear"],
+        weeksOfTheYear: lists["weeksOfYear"],
+        daysOfTheYear: lists["daysOfYear"],
+        setPositions: lists["setPositions"],
+        end: end
+    ))
+}
+
+/// A repeat rule in the shape `parseRecurrence` accepts. Lists that are not
+/// set are left out; a day of the week without a week number is a plain name.
+func recurrenceDict(_ rule: EKRecurrenceRule) -> [String: Any] {
+    var dict: [String: Any] = [
+        "frequency": frequencyName(rule.frequency),
+        "interval": rule.interval,
+    ]
+    if let days = rule.daysOfTheWeek, !days.isEmpty {
+        dict["daysOfWeek"] = days.map { day -> Any in
+            let raw = day.dayOfTheWeek.rawValue
+            let name = (1...7).contains(raw) ? weekdayNames[raw - 1] : String(raw)
+            if day.weekNumber == 0 { return name }
+            let item: [String: Any] = ["day": name, "week": day.weekNumber]
+            return item
+        }
+    }
+    let lists: [(String, [NSNumber]?)] = [
+        ("daysOfMonth", rule.daysOfTheMonth),
+        ("monthsOfYear", rule.monthsOfTheYear),
+        ("weeksOfYear", rule.weeksOfTheYear),
+        ("daysOfYear", rule.daysOfTheYear),
+        ("setPositions", rule.setPositions),
+    ]
+    for (key, values) in lists {
+        if let values = values, !values.isEmpty { dict[key] = values.map { $0.intValue } }
+    }
+    if let end = rule.recurrenceEnd {
+        if let date = end.endDate {
+            dict["end"] = ["date": isoFormatter.string(from: date)]
+        } else {
+            dict["end"] = ["count": end.occurrenceCount]
+        }
+    }
+    return dict
+}
+
+func hasRecurrence(_ r: EKReminder) -> Bool {
+    return !(r.recurrenceRules ?? []).isEmpty
+}
+
+let recurrenceNeedsDueDateMessage =
+    "A repeating reminder needs a due date: pass dueDate together with recurrence."
+
+// MARK: - Reminder serialisation -------------------------------------------
+
+/// Convert an EKReminder to a dictionary matching the skill's JSON schema.
+/// Keep field names identical to the AppleScript implementation so existing
+/// SKILL.md documentation stays accurate.
+func reminderDict(_ r: EKReminder) -> [String: Any] {
+    var dict: [String: Any] = [
+        "id": r.calendarItemIdentifier,
+        "name": r.title ?? "",
+        "body": r.notes ?? NSNull(),
+        "completed": r.isCompleted,
+        "priority": r.priority,
+        "flagged": false,  // EKReminder has no `flagged` attribute; see note
+        "list": r.calendar?.title ?? NSNull(),
+    ]
+
+    // Due date comes from dueDateComponents, not a Date directly. A day
+    // without a time is reported as YYYY-MM-DD, the form create and update
+    // accept for it, so it does not read as a reminder due at midnight.
+    if let day = dueDay(r.dueDateComponents) {
+        dict["due_date"] = String(format: "%04d-%02d-%02d", day.year!, day.month!, day.day!)
+    } else if let dc = r.dueDateComponents, let d = gregorian.date(from: dc) {
+        dict["due_date"] = isoFormatter.string(from: d)
+    } else {
+        dict["due_date"] = NSNull()
+    }
+
+    // remind_me_date: EventKit uses alarms for this. We expose the first
+    // absolute-date alarm if any.
+    if let alarms = r.alarms,
+       let firstAbs = alarms.first(where: { $0.absoluteDate != nil }),
+       let d = firstAbs.absoluteDate
+    {
+        dict["remind_me_date"] = isoFormatter.string(from: d)
+    } else {
+        dict["remind_me_date"] = NSNull()
+    }
+
+    if let cd = r.completionDate {
+        dict["completion_date"] = isoFormatter.string(from: cd)
+    } else {
+        dict["completion_date"] = NSNull()
+    }
+
+    // The Reminders app gives a reminder at most one repeat rule.
+    if let rule = r.recurrenceRules?.first {
+        dict["recurrence"] = recurrenceDict(rule)
+    } else {
+        dict["recurrence"] = NSNull()
+    }
+
+    return dict
+}
+
+// NOTE on `flagged`:
+// EKReminder does not expose the "flagged" property that AppleScript does,
+// so we report `false` for all reminders. The Claude Code skill ships an
+// AppleScript fallback (skills/apple-reminders/scripts/get_flagged.applescript)
+// for users who need flagged queries; this binary intentionally does not
+// expose a `get-flagged` command since it would always return an empty list.
+
+// MARK: - Store access ------------------------------------------------------
+
+/// How long to wait for macOS to answer an access request. A real dialog needs
+/// human reaction time, so the default is generous; CI and diagnostics can
+/// shorten it. Bounded because a request the OS refuses outright can leave the
+/// completion handler unfired, which used to hang the process indefinitely.
+let accessRequestTimeout: DispatchTimeInterval = {
+    let configured = ProcessInfo.processInfo.environment["REMINDERS_TCC_TIMEOUT_SECONDS"]
+    return .seconds(max(1, configured.flatMap(Int.init) ?? 120))
+}()
+
+/// Lazy, cached EKEventStore. Request access synchronously on first use.
+/// We exit with a permission error if access cannot be obtained.
+final class Store {
+    static let shared = Store()
+    let store: EKEventStore
+
+    private init() {
+        self.store = EKEventStore()
+    }
+
+    /// Request full access to reminders. Blocks until the user responds to
+    /// the system dialog (first run only), or until `accessRequestTimeout`.
+    func requestAccessOrExit() {
+        // A decision that has already been made cannot produce a dialog, so
+        // report it immediately instead of waiting for one that never comes.
+        switch EKEventStore.authorizationStatus(for: .reminder) {
+        case .restricted:
+            print(Json.err(
+                code: "PERMISSION_DENIED",
+                message: "Reminders access is restricted by a device policy."
+            ))
+            exit(1)
+        case .denied:
+            print(Json.err(
+                code: "PERMISSION_DENIED",
+                message: "Reminders access was denied. Re-enable it in "
+                    + "System Settings › Privacy & Security › Reminders."
+            ))
+            exit(1)
+        default:
+            break
+        }
+
+        let sem = DispatchSemaphore(value: 0)
+        var granted = false
+        var failure: Error?
+        let completion: EKEventStoreRequestAccessCompletionHandler = { ok, err in
+            granted = ok
+            failure = err
+            sem.signal()
+        }
+
+        // `#available` is a runtime check: the compiler still needs the macOS 14
+        // symbol in its SDK. Swift 5.9 ships with Xcode 15, the first toolchain
+        // carrying the macOS 14 SDK, so older toolchains (e.g. on macOS 13)
+        // compile only the fallback instead of failing the build.
+        #if compiler(>=5.9)
+        if #available(macOS 14.0, *) {
+            store.requestFullAccessToReminders(completion: completion)
+        } else {
+            store.requestAccess(to: .reminder, completion: completion)
+        }
+        #else
+        store.requestAccess(to: .reminder, completion: completion)
+        #endif
+
+        // A request macOS refuses outright — because the responsible process
+        // declares no Reminders usage description — can leave this handler
+        // unfired forever, so the wait is bounded.
+        if sem.wait(timeout: .now() + accessRequestTimeout) == .timedOut {
+            print(Json.err(
+                code: "PERMISSION_UNAVAILABLE",
+                message: "macOS never answered the Reminders access request and no "
+                    + "dialog appeared. The host application this server runs under "
+                    + "cannot request Reminders access."
+            ))
+            exit(1)
+        }
+
+        if !granted {
+            // Distinguish "you said no" from "you were never asked" — the two
+            // need opposite remedies, and conflating them sends users chasing
+            // a System Settings entry or a `tccutil reset` that cannot help.
+            let message: String
+            if let failure = failure {
+                message = failure.localizedDescription
+            } else if EKEventStore.authorizationStatus(for: .reminder) == .denied {
+                message = "You declined Reminders access. Re-enable it in "
+                    + "System Settings › Privacy & Security › Reminders."
+            } else {
+                print(Json.err(
+                    code: "PERMISSION_UNAVAILABLE",
+                    message: "macOS refused the Reminders access request without showing "
+                        + "a dialog, and left no entry in System Settings. This happens "
+                        + "when the responsible process declares no Reminders usage "
+                        + "description; granting or resetting permissions cannot fix it."
+                ))
+                exit(1)
+            }
+            print(Json.err(code: "PERMISSION_DENIED", message: message))
+            exit(1)
+        }
+    }
+
+    /// Fetch all calendars of type .reminder.
+    func lists() -> [EKCalendar] {
+        return store.calendars(for: .reminder)
+    }
+
+    /// Fetch reminders matching a predicate, synchronously.
+    func fetch(_ predicate: NSPredicate) -> [EKReminder] {
+        let sem = DispatchSemaphore(value: 0)
+        var result: [EKReminder] = []
+        store.fetchReminders(matching: predicate) { reminders in
+            result = reminders ?? []
+            sem.signal()
+        }
+        sem.wait()
+        return result
+    }
+
+    /// Find a reminder by its EventKit identifier (`calendarItemIdentifier`).
+    /// EventKit has no direct lookup, so we scan all reminders. That's still
+    /// O(n) but indexed by the framework and vastly faster than the
+    /// AppleScript equivalent.
+    func reminder(id: String) -> EKReminder? {
+        let predicate = store.predicateForReminders(in: nil)
+        return fetch(predicate).first(where: { $0.calendarItemIdentifier == id })
+    }
+}
+
+// MARK: - List resolution ---------------------------------------------------
+
+/// Result of resolving a reminder list by user-supplied name or id.
+enum ListLookup {
+    case found(EKCalendar)
+    case notFound
+    case ambiguous([EKCalendar])
+}
+
+/// Resolve a list by exact title, or by calendar identifier if the input
+/// starts with `id:`. Multiple calendars with the same title (common when
+/// you have iCloud + local accounts both exposing a "Personal" list) yield
+/// `.ambiguous` so callers can surface the ambiguity to the user instead
+/// of silently picking the first match.
+func resolveList(_ nameOrId: String) -> ListLookup {
+    if nameOrId.hasPrefix("id:") {
+        let id = String(nameOrId.dropFirst(3))
+        if let cal = Store.shared.lists()
+            .first(where: { $0.calendarIdentifier == id })
+        {
+            return .found(cal)
+        }
+        return .notFound
+    }
+    let matches = Store.shared.lists().filter { $0.title == nameOrId }
+    switch matches.count {
+    case 0: return .notFound
+    case 1: return .found(matches[0])
+    default: return .ambiguous(matches)
+    }
+}
+
+/// Outcome of `requireList(_:)`. Either resolved to a single calendar, or
+/// carries a fully-formed JSON error envelope the caller can return verbatim.
+/// A custom enum (instead of `Result<EKCalendar, String>`) avoids forcing
+/// `String` to conform to `Error`, which Swift's stdlib does not provide.
+enum ListResolution {
+    case ok(EKCalendar)
+    case error(String)
+}
+
+/// Command-side list resolver. Returns either a calendar or a fully-formed
+/// error JSON envelope. Every command that takes a list name as input goes
+/// through this helper so the error shape and ambiguity handling are
+/// consistent across the binary.
+func requireList(_ nameOrId: String) -> ListResolution {
+    switch resolveList(nameOrId) {
+    case .found(let cal):
+        return .ok(cal)
+
+    case .notFound:
+        return .error(
+            Json.err(
+                code: "LIST_NOT_FOUND",
+                message: "No reminder list matching '\(nameOrId)'. Use the exact title, or 'id:<calendar_identifier>' from list-lists."
+            )
+        )
+
+    case .ambiguous(let cals):
+        let candidates: [[String: Any]] = cals.map { cal in
+            return [
+                "name": cal.title,
+                "account": cal.source?.title ?? NSNull(),
+                "calendar_identifier": cal.calendarIdentifier,
+            ]
+        }
+        return .error(
+            Json.errWith(
+                code: "LIST_AMBIGUOUS",
+                message: "Multiple reminder lists match '\(nameOrId)'. Use 'id:<calendar_identifier>' from the candidates field to disambiguate.",
+                extra: ["candidates": candidates]
+            )
+        )
+    }
+}
+
+// MARK: - Commands ----------------------------------------------------------
+
+enum Command {
+    static func listLists() -> String {
+        let cals = Store.shared.lists()
+        var out: [[String: Any]] = []
+        for cal in cals {
+            // open/completed counts via predicates
+            let store = Store.shared.store
+            let openPred = store.predicateForIncompleteReminders(
+                withDueDateStarting: nil, ending: nil, calendars: [cal]
+            )
+            let donePred = store.predicateForCompletedReminders(
+                withCompletionDateStarting: nil, ending: nil, calendars: [cal]
+            )
+            let openCount = Store.shared.fetch(openPred).count
+            let doneCount = Store.shared.fetch(donePred).count
+            out.append([
+                "name": cal.title,
+                "account": cal.source?.title ?? NSNull(),
+                "calendar_identifier": cal.calendarIdentifier,
+                "open_count": openCount,
+                "completed_count": doneCount,
+            ])
+        }
+        return Json.ok(["lists": out])
+    }
+
+    static func getListInfo(_ name: String) -> String {
+        let cal: EKCalendar
+        switch requireList(name) {
+        case .ok(let c): cal = c
+        case .error(let err): return err
+        }
+        let store = Store.shared.store
+        let openPred = store.predicateForIncompleteReminders(
+            withDueDateStarting: nil, ending: nil, calendars: [cal]
+        )
+        let donePred = store.predicateForCompletedReminders(
+            withCompletionDateStarting: nil, ending: nil, calendars: [cal]
+        )
+        let openCount = Store.shared.fetch(openPred).count
+        let doneCount = Store.shared.fetch(donePred).count
+        return Json.ok([
+            "name": cal.title,
+            "account": cal.source?.title ?? NSNull(),
+            "calendar_identifier": cal.calendarIdentifier,
+            "open_count": openCount,
+            "completed_count": doneCount,
+        ])
+    }
+
+    static func listReminders(_ listName: String, _ filter: String) -> String {
+        let cal: EKCalendar
+        switch requireList(listName) {
+        case .ok(let c): cal = c
+        case .error(let err): return err
+        }
+        let store = Store.shared.store
+        let pred: NSPredicate
+        switch filter {
+        case "open":
+            pred = store.predicateForIncompleteReminders(
+                withDueDateStarting: nil, ending: nil, calendars: [cal]
+            )
+        case "completed":
+            pred = store.predicateForCompletedReminders(
+                withCompletionDateStarting: nil, ending: nil, calendars: [cal]
+            )
+        case "all":
+            pred = store.predicateForReminders(in: [cal])
+        default:
+            return Json.err(
+                code: "INVALID_FILTER",
+                message: "Filter must be one of open|completed|all."
+            )
+        }
+        let items = Store.shared.fetch(pred).map(reminderDict)
+        return Json.ok(["reminders": items])
+    }
+
+    static func searchReminders(
+        _ query: String, _ filter: String, _ limit: Int
+    ) -> String {
+        let store = Store.shared.store
+        let pred: NSPredicate
+        switch filter {
+        case "open":
+            pred = store.predicateForIncompleteReminders(
+                withDueDateStarting: nil, ending: nil, calendars: nil
+            )
+        case "completed":
+            pred = store.predicateForCompletedReminders(
+                withCompletionDateStarting: nil, ending: nil, calendars: nil
+            )
+        case "all":
+            pred = store.predicateForReminders(in: nil)
+        default:
+            return Json.err(
+                code: "INVALID_FILTER",
+                message: "Filter must be one of open|completed|all."
+            )
+        }
+        let needle = query.lowercased()
+        var hits: [EKReminder] = []
+        for r in Store.shared.fetch(pred) {
+            let title = (r.title ?? "").lowercased()
+            let body = (r.notes ?? "").lowercased()
+            if title.contains(needle) || body.contains(needle) {
+                hits.append(r)
+                if limit > 0 && hits.count >= limit { break }
+            }
+        }
+        return Json.ok(["reminders": hits.map(reminderDict)])
+    }
+
+    /// All incomplete reminders whose due date lies `where` relative to
+    /// today, with or without a due time.
+    static func openReminders(due when: DueRelativeToToday) -> String {
+        let pred = Store.shared.store.predicateForIncompleteReminders(
+            withDueDateStarting: nil, ending: nil, calendars: nil
+        )
+        let now = Date()
+        let items = Store.shared.fetch(pred)
+            .filter { dueRelativeToToday($0.dueDateComponents, now: now) == when }
+            .map(reminderDict)
+        return Json.ok(["reminders": items])
+    }
+
+    static func getToday() -> String {
+        return openReminders(due: .today)
+    }
+
+    static func getOverdue() -> String {
+        // Strictly before today 00:00: a reminder due earlier today is not
+        // overdue yet.
+        return openReminders(due: .before)
+    }
+
+    static func getScheduled() -> String {
+        // All incomplete reminders with any due date. EventKit's predicate
+        // doesn't distinguish "has a due date" from "has no due date", so we
+        // post-filter.
+        let pred = Store.shared.store.predicateForIncompleteReminders(
+            withDueDateStarting: nil, ending: nil, calendars: nil
+        )
+        let items = Store.shared.fetch(pred)
+            .filter { $0.dueDateComponents != nil }
+            .map(reminderDict)
+        return Json.ok(["reminders": items])
+    }
+
+    static func getReminder(_ id: String) -> String {
+        guard let r = Store.shared.reminder(id: id) else {
+            return Json.err(
+                code: "REMINDER_NOT_FOUND",
+                message: "No reminder with id '\(id)'."
+            )
+        }
+        return Json.ok(["reminder": reminderDict(r)])
+    }
+
+    static func createReminder(_ payloadJson: String) -> String {
+        guard let data = payloadJson.data(using: .utf8),
+              let raw = try? JSONSerialization.jsonObject(with: data),
+              let obj = raw as? [String: Any]
+        else {
+            return Json.err(
+                code: "INVALID_PAYLOAD",
+                message: "Payload must be a JSON object."
+            )
+        }
+        guard let listName = obj["list"] as? String else {
+            return Json.err(
+                code: "INVALID_PAYLOAD",
+                message: "Missing required field 'list'."
+            )
+        }
+        guard let title = obj["title"] as? String else {
+            return Json.err(
+                code: "INVALID_PAYLOAD",
+                message: "Missing required field 'title'."
+            )
+        }
+        let cal: EKCalendar
+        switch requireList(listName) {
+        case .ok(let c): cal = c
+        case .error(let err): return err
+        }
+
+        let priority = obj["priority"] as? Int ?? 0
+        if ![0, 1, 5, 9].contains(priority) {
+            return Json.err(
+                code: "INVALID_PRIORITY",
+                message: "Priority must be one of 0, 1, 5, 9."
+            )
+        }
+
+        var rule: EKRecurrenceRule? = nil
+        if let rawRecurrence = obj["recurrence"], !(rawRecurrence is NSNull) {
+            switch parseRecurrence(rawRecurrence) {
+            case .rule(let parsed): rule = parsed
+            case .invalid(let message):
+                return Json.err(code: "INVALID_PAYLOAD", message: message)
+            }
+        }
+
+        let r = EKReminder(eventStore: Store.shared.store)
+        r.calendar = cal
+        r.title = title
+        if let body = obj["body"] as? String { r.notes = body }
+        r.priority = priority
+
+        if let dueStr = obj["dueDate"] as? String {
+            guard let due = parseDueDate(dueStr) else {
+                return Json.err(
+                    code: "INVALID_PAYLOAD",
+                    message: invalidDueDateMessage(dueStr)
+                )
+            }
+            setDueDate(r, due)
+        }
+
+        if let rule = rule {
+            // EventKit refuses to save a repeating reminder without one
+            // (EKError.recurringReminderRequiresDueDate).
+            guard r.dueDateComponents != nil else {
+                return Json.err(code: "INVALID_PAYLOAD", message: recurrenceNeedsDueDateMessage)
+            }
+            r.recurrenceRules = [rule]
+        }
+
+        do {
+            try Store.shared.store.save(r, commit: true)
+        } catch {
+            return Json.err(
+                code: "SAVE_FAILED",
+                message: error.localizedDescription
+            )
+        }
+        return Json.ok(["reminder": reminderDict(r)])
+    }
+
+    static func updateReminder(_ payloadJson: String) -> String {
+        guard let data = payloadJson.data(using: .utf8),
+              let raw = try? JSONSerialization.jsonObject(with: data),
+              let obj = raw as? [String: Any]
+        else {
+            return Json.err(
+                code: "INVALID_PAYLOAD",
+                message: "Payload must be a JSON object."
+            )
+        }
+        guard let id = obj["id"] as? String else {
+            return Json.err(
+                code: "INVALID_PAYLOAD",
+                message: "Missing required field 'id'."
+            )
+        }
+        guard let r = Store.shared.reminder(id: id) else {
+            return Json.err(
+                code: "REMINDER_NOT_FOUND",
+                message: "No reminder with id '\(id)'."
+            )
+        }
+
+        if let title = obj["title"] as? String { r.title = title }
+        if let body = obj["body"] as? String { r.notes = body }
+
+        if let priority = obj["priority"] as? Int {
+            if ![0, 1, 5, 9].contains(priority) {
+                return Json.err(
+                    code: "INVALID_PRIORITY",
+                    message: "Priority must be one of 0, 1, 5, 9."
+                )
+            }
+            r.priority = priority
+        }
+
+        let clearRecurrence = (obj["clearRecurrence"] as? Bool) ?? false
+        var rule: EKRecurrenceRule? = nil
+        if let rawRecurrence = obj["recurrence"], !(rawRecurrence is NSNull) {
+            if clearRecurrence {
+                return Json.err(
+                    code: "INVALID_PAYLOAD",
+                    message: "Pass either recurrence or clearRecurrence, not both."
+                )
+            }
+            switch parseRecurrence(rawRecurrence) {
+            case .rule(let parsed): rule = parsed
+            case .invalid(let message):
+                return Json.err(code: "INVALID_PAYLOAD", message: message)
+            }
+        }
+
+        let clearDue = (obj["clearDueDate"] as? Bool) ?? false
+        if clearDue {
+            r.dueDateComponents = nil
+            if let alarms = r.alarms {
+                for a in alarms { r.removeAlarm(a) }
+            }
+        } else if let dueStr = obj["dueDate"] as? String {
+            guard let due = parseDueDate(dueStr) else {
+                return Json.err(
+                    code: "INVALID_PAYLOAD",
+                    message: invalidDueDateMessage(dueStr)
+                )
+            }
+            // Existing alarms belong to the old due date.
+            if let alarms = r.alarms {
+                for a in alarms { r.removeAlarm(a) }
+            }
+            setDueDate(r, due)
+        }
+
+        if clearRecurrence {
+            r.recurrenceRules = nil
+        } else if let rule = rule {
+            r.recurrenceRules = [rule]
+        }
+
+        // EventKit refuses to save a repeating reminder without a due date
+        // (EKError.recurringReminderRequiresDueDate). Say which field to add
+        // instead of passing its error through.
+        if hasRecurrence(r) && r.dueDateComponents == nil {
+            return Json.err(
+                code: "INVALID_PAYLOAD",
+                message: rule != nil
+                    ? recurrenceNeedsDueDateMessage
+                    : "This reminder repeats, and a repeating reminder needs a due date. To remove the due date, pass clearRecurrence: true as well."
+            )
+        }
+
+        do {
+            try Store.shared.store.save(r, commit: true)
+        } catch {
+            return Json.err(
+                code: "SAVE_FAILED",
+                message: error.localizedDescription
+            )
+        }
+        return Json.ok(["reminder": reminderDict(r)])
+    }
+
+    static func completeReminder(_ id: String) -> String {
+        guard let r = Store.shared.reminder(id: id) else {
+            return Json.err(
+                code: "REMINDER_NOT_FOUND",
+                message: "No reminder with id '\(id)'."
+            )
+        }
+        r.isCompleted = true
+        do {
+            try Store.shared.store.save(r, commit: true)
+        } catch {
+            return Json.err(
+                code: "SAVE_FAILED",
+                message: error.localizedDescription
+            )
+        }
+        return Json.ok(["reminder": reminderDict(r)])
+    }
+
+    static func uncompleteReminder(_ id: String) -> String {
+        guard let r = Store.shared.reminder(id: id) else {
+            return Json.err(
+                code: "REMINDER_NOT_FOUND",
+                message: "No reminder with id '\(id)'."
+            )
+        }
+        r.isCompleted = false
+        do {
+            try Store.shared.store.save(r, commit: true)
+        } catch {
+            return Json.err(
+                code: "SAVE_FAILED",
+                message: error.localizedDescription
+            )
+        }
+        return Json.ok(["reminder": reminderDict(r)])
+    }
+
+    static func deleteReminder(_ id: String) -> String {
+        guard let r = Store.shared.reminder(id: id) else {
+            return Json.err(
+                code: "REMINDER_NOT_FOUND",
+                message: "No reminder with id '\(id)'."
+            )
+        }
+        do {
+            try Store.shared.store.remove(r, commit: true)
+        } catch {
+            return Json.err(
+                code: "DELETE_FAILED",
+                message: error.localizedDescription
+            )
+        }
+        return Json.ok(["deleted_id": id])
+    }
+}
+
+// MARK: - TCC responsibility ------------------------------------------------
+
+/// Environment marker so the re-exec below happens exactly once.
+let disclaimGuardVariable = "REMINDERS_EVENTKIT_TCC_DISCLAIMED"
+
+/// Re-exec this process with TCC responsibility disclaimed.
+///
+/// macOS attributes a privacy request to the *responsible* process, which for
+/// a helper spawned by a GUI host is that host. Claude Desktop's bundle
+/// declares no Reminders usage string, so tccd refuses the request before
+/// EventKit is ever reached: no dialog, no entry in System Settings, and no
+/// way for the user to grant anything. `responsibility_spawnattrs_setdisclaim`
+/// makes the new process image its own responsible process, so macOS reads the
+/// usage strings from our embedded `__TEXT,__info_plist` instead of from the
+/// host's bundle. This is the same private libSystem call Chromium uses to
+/// make its helper processes self-responsible; it is resolved via `dlsym` so a
+/// future macOS that drops the symbol degrades to the old host-attributed
+/// behaviour rather than failing to launch.
+///
+/// `POSIX_SPAWN_SETEXEC` replaces the process image in place, so file
+/// descriptors, exit codes and signals need no proxying. That is also why this
+/// must run before any argument parsing or stdin handling: an unread stdin
+/// payload survives the exec untouched, but a consumed one would not.
+func reexecDisclaimingTCCResponsibility() {
+    guard ProcessInfo.processInfo.environment[disclaimGuardVariable] == nil else { return }
+
+    typealias SetDisclaim =
+        @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
+    // RTLD_DEFAULT is a cast macro and therefore not imported into Swift.
+    guard let symbol = dlsym(
+        UnsafeMutableRawPointer(bitPattern: -2),
+        "responsibility_spawnattrs_setdisclaim"
+    ) else { return }
+    let setDisclaim = unsafeBitCast(symbol, to: SetDisclaim.self)
+
+    var executablePath = [CChar](repeating: 0, count: Int(PATH_MAX))
+    var pathSize = UInt32(executablePath.count)
+    guard _NSGetExecutablePath(&executablePath, &pathSize) == 0 else { return }
+
+    var attributes: posix_spawnattr_t?
+    guard posix_spawnattr_init(&attributes) == 0 else { return }
+    defer { posix_spawnattr_destroy(&attributes) }
+
+    guard posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETEXEC)) == 0,
+          setDisclaim(&attributes, 1) == 0
+    else { return }
+
+    setenv(disclaimGuardVariable, "1", 1)
+
+    // On success this does not return — the image is replaced. If it does
+    // return, the spawn failed; carry on undisclaimed rather than dying, so
+    // hosts that are already a valid responsible process keep working.
+    posix_spawn(nil, executablePath, nil, &attributes, CommandLine.unsafeArgv, environ)
+    unsetenv(disclaimGuardVariable)
+}
+
+// MARK: - Entry point -------------------------------------------------------
+
+func usage() -> String {
+    return Json.err(
+        code: "USAGE",
+        message: "Usage: reminders-eventkit <command> [args]. See source for command list."
+    )
+}
+
+reexecDisclaimingTCCResponsibility()
+
+let args = CommandLine.arguments
+if args.count < 2 {
+    print(usage())
+    exit(1)
+}
+
+let cmd = args[1]
+let rest = Array(args.dropFirst(2))
+
+// -------------------------------------------------------------------------
+// Step 1: Validate command name + arity BEFORE touching EventKit, so that
+// bogus invocations (typos, missing args) don't trigger the macOS TCC
+// permission dialog.
+// -------------------------------------------------------------------------
+
+let requiredArity: [String: Int] = [
+    "list-lists":          0,
+    "get-list-info":       1,
+    "list-reminders":      2,
+    "search-reminders":    3,
+    "get-today":           0,
+    "get-overdue":         0,
+    "get-scheduled":       0,
+    "get-reminder":        1,
+    "create-reminder":     1,
+    "update-reminder":     1,
+    "complete-reminder":   1,
+    "uncomplete-reminder": 1,
+    "delete-reminder":     1,
+]
+
+guard let needed = requiredArity[cmd] else {
+    print(Json.err(code: "UNKNOWN_COMMAND", message: "Unknown command: \(cmd)"))
+    exit(1)
+}
+if rest.count < needed {
+    print(usage())
+    exit(1)
+}
+
+// -------------------------------------------------------------------------
+// Step 1.5: Semantic validation of arguments (filter values, limit ≥ 0,
+// JSON payload shape) BEFORE the macOS TCC prompt, so malformed calls
+// don't leave a ghost permission dialog. Stdin is read here so it's
+// consumed exactly once.
+// -------------------------------------------------------------------------
+
+let validFilters: Set<String> = ["open", "completed", "all"]
+var stdinPayload: String? = nil
+
+switch cmd {
+case "list-reminders":
+    if !validFilters.contains(rest[1]) {
+        print(Json.err(code: "INVALID_FILTER", message: "Filter must be one of open|completed|all."))
+        exit(1)
+    }
+case "search-reminders":
+    if !validFilters.contains(rest[1]) {
+        print(Json.err(code: "INVALID_FILTER", message: "Filter must be one of open|completed|all."))
+        exit(1)
+    }
+    guard let limit = Int(rest[2]) else {
+        print(Json.err(code: "INVALID_PAYLOAD", message: "limit must be an integer."))
+        exit(1)
+    }
+    if limit < 0 {
+        print(Json.err(code: "INVALID_PAYLOAD", message: "limit must be ≥ 0."))
+        exit(1)
+    }
+case "create-reminder", "update-reminder":
+    let payload = rest[0] == "-" ? readStdinAsString() : rest[0]
+    guard let data = payload.data(using: .utf8),
+          let raw = try? JSONSerialization.jsonObject(with: data),
+          raw is [String: Any]
+    else {
+        print(Json.err(code: "INVALID_PAYLOAD", message: "Payload must be a JSON object."))
+        exit(1)
+    }
+    stdinPayload = payload
+default:
+    break
+}
+
+// -------------------------------------------------------------------------
+// Step 2: Request EventKit access now that we know the invocation is
+// well-formed. TCC caches the grant across runs.
+// -------------------------------------------------------------------------
+
+Store.shared.requestAccessOrExit()
+
+// -------------------------------------------------------------------------
+// Step 3: Dispatch. create/update use the payload pre-fetched in Step 1.5.
+// -------------------------------------------------------------------------
+
+let output: String
+switch cmd {
+case "list-lists":
+    output = Command.listLists()
+case "get-list-info":
+    output = Command.getListInfo(rest[0])
+case "list-reminders":
+    output = Command.listReminders(rest[0], rest[1])
+case "search-reminders":
+    output = Command.searchReminders(rest[0], rest[1], Int(rest[2])!)
+case "get-today":
+    output = Command.getToday()
+case "get-overdue":
+    output = Command.getOverdue()
+case "get-scheduled":
+    output = Command.getScheduled()
+case "get-reminder":
+    output = Command.getReminder(rest[0])
+case "create-reminder":
+    output = Command.createReminder(stdinPayload!)
+case "update-reminder":
+    output = Command.updateReminder(stdinPayload!)
+case "complete-reminder":
+    output = Command.completeReminder(rest[0])
+case "uncomplete-reminder":
+    output = Command.uncompleteReminder(rest[0])
+case "delete-reminder":
+    output = Command.deleteReminder(rest[0])
+default:
+    output = Json.err(code: "UNKNOWN_COMMAND", message: "Unknown command: \(cmd)")
+}
+
+print(output)
+
+// Exit 0 on ok, 1 on error. Parse the envelope's `status` field explicitly
+// rather than prefix-matching the raw string, so JSON key ordering and
+// whitespace are irrelevant.
+if let data = output.data(using: .utf8),
+   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+   (obj["status"] as? String) == "ok"
+{
+    exit(0)
+} else {
+    exit(1)
+}

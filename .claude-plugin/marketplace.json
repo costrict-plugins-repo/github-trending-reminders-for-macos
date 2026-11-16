@@ -1,0 +1,14 @@
+{
+  "name": "high5-apple-reminders-for-claude",
+  "owner": {
+    "name": "high5 ventures GmbH",
+    "url": "https://h5ventures.de"
+  },
+  "plugins": [
+    {
+      "name": "apple-reminders",
+      "source": ".",
+      "description": "Fast, native Apple Reminders access for Claude Code via a signed Swift/EventKit binary."
+    }
+  ]
+}

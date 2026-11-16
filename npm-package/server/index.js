@@ -1,0 +1,661 @@
+#!/usr/bin/env node
+
+// Copyright (c) 2026 high5 ventures GmbH
+// SPDX-License-Identifier: MIT
+//
+// apple-reminders MCP server — thin stdio wrapper around the bundled
+// Swift/EventKit binary (bin/reminders-eventkit). One tool call = one
+// spawn of the binary with positional or JSON-payload arguments. All
+// reading, parsing, and schema work lives in Swift; Node only translates.
+
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { execFile } from "child_process";
+import { promisify } from "util";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, resolve } from "path";
+
+const execFileAsync = promisify(execFile);
+
+const here = dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(
+  readFileSync(resolve(here, "..", "package.json"), "utf8")
+);
+const VERSION = pkg.version;
+
+const BINARY = process.env.REMINDERS_BINARY;
+if (!BINARY) {
+  console.error("REMINDERS_BINARY env var is not set");
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Binary invocation
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the Swift binary with the given argv. Always returns the parsed JSON
+ * envelope ({status, data|code|message}). Never throws on binary errors —
+ * the envelope carries them through to the caller so the MCP layer can
+ * decide how to surface them.
+ *
+ * Throws only if the binary itself crashes, is missing, or emits non-JSON.
+ */
+// Hard ceiling on a single binary invocation. The Swift binary is designed
+// to return in well under a second on databases with hundreds of reminders,
+// so anything approaching this value almost certainly means the macOS TCC
+// permission prompt is waiting for the user (first run only) or EventKit is
+// wedged. 30 s keeps us well inside the MCP client's own request timeout
+// while giving first-run users time to click "Allow".
+const BINARY_TIMEOUT_MS = 30_000;
+
+async function runBinary(args, { stdin } = {}) {
+  let stdout = "";
+  let stderr = "";
+  let exitCode = 0;
+  let killed = false;
+  let signal = null;
+  try {
+    const child = execFileAsync(BINARY, args, {
+      maxBuffer: 16 * 1024 * 1024, // 16 MB — plenty for large reminder lists
+      timeout: BINARY_TIMEOUT_MS,
+      killSignal: "SIGTERM",
+    });
+    if (typeof stdin === "string") {
+      child.child.stdin.end(stdin);
+    }
+    const result = await child;
+    stdout = result.stdout;
+    stderr = result.stderr;
+  } catch (err) {
+    // execFile throws on non-zero exit, on timeout, and on signal. The binary
+    // uses exit 1 for logical errors and still emits a JSON envelope on
+    // stdout — salvage it when possible.
+    stdout = err.stdout || "";
+    stderr = err.stderr || "";
+    exitCode = typeof err.code === "number" ? err.code : 1;
+    killed = err.killed === true;
+    signal = err.signal || null;
+
+    // Timeout: Node kills the child with SIGTERM and sets `killed: true`.
+    if (killed && signal === "SIGTERM") {
+      const e = new Error(
+        `Reminders binary timed out after ${BINARY_TIMEOUT_MS} ms. ` +
+          `If this is the first invocation, macOS may be waiting for you to ` +
+          `grant Reminders access in the privacy prompt — click "Allow" and ` +
+          `retry. Otherwise, EventKit may be wedged; try again in a moment.`
+      );
+      e.envelopeCode = "WRAPPER_TIMEOUT";
+      throw e;
+    }
+    if (!stdout) {
+      const e = new Error(
+        `Binary crashed (exit ${exitCode}${signal ? `, signal ${signal}` : ""}): ${stderr || err.message}`
+      );
+      e.envelopeCode = "WRAPPER_BINARY_CRASH";
+      throw e;
+    }
+  }
+
+  const line = stdout.trim();
+  if (!line) {
+    const e = new Error(
+      `Binary produced no output (exit ${exitCode}, stderr: ${stderr})`
+    );
+    e.envelopeCode = "WRAPPER_EMPTY_OUTPUT";
+    throw e;
+  }
+  try {
+    return JSON.parse(line);
+  } catch (_parseErr) {
+    const e = new Error(
+      `Binary produced non-JSON output: ${line.slice(0, 500)}`
+    );
+    e.envelopeCode = "WRAPPER_NON_JSON_OUTPUT";
+    throw e;
+  }
+}
+
+/**
+ * Wrap a binary envelope as an MCP tool result. The envelope is always
+ * returned verbatim as JSON text — downstream tools and the LLM see the
+ * exact same schema that the skill's Bash path returns.
+ */
+function envelopeToMcpResult(envelope) {
+  const text = JSON.stringify(envelope, null, 2);
+  const isError = envelope.status === "error";
+  return {
+    content: [{ type: "text", text }],
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tool definitions
+// ---------------------------------------------------------------------------
+
+// Tool annotations follow MCP's ToolAnnotations schema so clients (Claude
+// Desktop, Cowork, Code) can decide when to auto-run vs. prompt the user:
+//
+//   readOnlyHint    — tool does not modify state (pure query)
+//   destructiveHint — tool may destroy or irreversibly alter existing state
+//   idempotentHint  — calling twice with the same args has the same effect
+//   openWorldHint   — tool reaches out beyond the local machine
+//
+// Every reminders tool is local-only, so openWorldHint is always false.
+const READ_ONLY = { readOnlyHint: true, openWorldHint: false };
+const ADDITIVE = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+// Completing a repeating reminder completes one occurrence per call.
+const DESTRUCTIVE = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+const DESTRUCTIVE_IDEMPOTENT = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+
+// Every list argument goes through the binary's resolveList(), which accepts
+// an exact title or `id:` plus a calendar_identifier, and refuses to guess
+// between lists that share a title.
+const LIST_REFERENCE =
+  "Exact list name, or 'id:<calendar_identifier>' from get_lists. If several " +
+  "lists share the name, the call fails with LIST_AMBIGUOUS and a `candidates` " +
+  "array; retry with the id: form.";
+
+const REMINDER_ID = {
+  type: "string",
+  description: "EventKit UUID: the `id` field of any reminder result",
+};
+
+// The binary validates the rule (parseRecurrence in the Swift source); this
+// schema only tells the model its shape. Read results report a rule in the
+// same shape, so it can be passed back unchanged.
+const WEEKDAYS = [
+  "sunday",
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+];
+const INT_LIST = (what) => ({
+  type: "array",
+  items: { type: "integer" },
+  description: what,
+});
+const RECURRENCE = {
+  type: "object",
+  description:
+    "Makes the reminder repeat, like Repeat in the Reminders app. Needs a dueDate, which is the first occurrence. " +
+    "Examples: every weekday {frequency: 'weekly', daysOfWeek: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday']}; " +
+    "every other week {frequency: 'weekly', interval: 2}; last Friday of each month " +
+    "{frequency: 'monthly', daysOfWeek: [{day: 'friday', week: -1}]}; last day of each month " +
+    "{frequency: 'monthly', daysOfMonth: [-1]}.",
+  properties: {
+    frequency: {
+      type: "string",
+      enum: ["daily", "weekly", "monthly", "yearly"],
+      description: "The unit it repeats in",
+    },
+    interval: {
+      type: "integer",
+      minimum: 1,
+      default: 1,
+      description: "Repeat every N units (default 1)",
+    },
+    daysOfWeek: {
+      type: "array",
+      items: {
+        anyOf: [
+          { type: "string", enum: WEEKDAYS },
+          {
+            type: "object",
+            properties: {
+              day: { type: "string", enum: WEEKDAYS },
+              week: {
+                type: "integer",
+                description:
+                  "The nth such weekday of the month (1 to 5) or year (1 to 53); -1 is the last",
+              },
+            },
+            required: ["day"],
+            additionalProperties: false,
+          },
+        ],
+      },
+      description:
+        "Weekly, monthly or yearly: the weekdays it falls on; the object form picks the nth weekday (monthly or yearly)",
+    },
+    daysOfMonth: INT_LIST("Monthly: days 1 to 31; -1 is the last day"),
+    monthsOfYear: INT_LIST("Yearly: months 1 to 12"),
+    weeksOfYear: INT_LIST("Yearly: weeks 1 to 53; -1 is the last"),
+    daysOfYear: INT_LIST("Yearly: days 1 to 366; -1 is the last"),
+    setPositions: INT_LIST(
+      "Keeps only the nth of the days the other lists give per period; -1 is the last. " +
+        "Last weekday of the month: frequency monthly, daysOfWeek monday to friday, setPositions [-1]"
+    ),
+    end: {
+      type: "object",
+      description:
+        "When it stops repeating; omit to repeat forever. {date: '2026-12-31'} repeats through that day, " +
+        "{count: 10} stops after 10 occurrences.",
+      properties: {
+        date: {
+          type: "string",
+          description:
+            "YYYY-MM-DD, or ISO-8601 local time like 2026-12-31T18:00:00 to stop at that moment",
+        },
+        count: { type: "integer", minimum: 1 },
+      },
+      additionalProperties: false,
+    },
+  },
+  required: ["frequency"],
+  additionalProperties: false,
+};
+
+const TOOLS = [
+  {
+    name: "get_lists",
+    description:
+      "List all reminder lists on this Mac with their account, open and completed counts, " +
+      "and the `calendar_identifier` that list arguments accept as 'id:<calendar_identifier>'. " +
+      "No arguments. " +
+      // The contract every tool shares, stated once.
+      "Every tool returns {status: 'ok', data} or {status: 'error', code, message}. " +
+      "Reminder objects carry `id`, `name` (the title), `body` (the notes), `due_date`, " +
+      "`remind_me_date`, `completed`, `completion_date`, `priority`, `list` and `recurrence` " +
+      "(null, or the repeat rule in the form create_reminder takes); dates are " +
+      "local time like 2026-04-11T18:00:00, and a `due_date` without a time is a date only, " +
+      "like 2026-04-11. `flagged` is always false because EventKit does " +
+      "not expose it. The first call can fail with WRAPPER_TIMEOUT while macOS shows the " +
+      "Reminders permission prompt; retry once the user has answered it.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { title: "Get reminder lists", ...READ_ONLY },
+  },
+  {
+    name: "get_list_info",
+    description:
+      "Get one reminder list's account, open and completed counts, and calendar_identifier.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        list: { type: "string", description: LIST_REFERENCE },
+      },
+      required: ["list"],
+    },
+    annotations: { title: "Get list info", ...READ_ONLY },
+  },
+  {
+    name: "list_reminders",
+    description:
+      "List reminders in a specific list. Filter must be one of: open, completed, all.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        list: { type: "string", description: LIST_REFERENCE },
+        filter: {
+          type: "string",
+          enum: ["open", "completed", "all"],
+          default: "open",
+          description: "Which reminders to include (default: open)",
+        },
+      },
+      required: ["list"],
+    },
+    annotations: { title: "List reminders", ...READ_ONLY },
+  },
+  {
+    name: "search_reminders",
+    description:
+      "Full-text search across all reminder lists. Matches against title and notes. Case-insensitive.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Search query, matched against title and notes",
+        },
+        filter: {
+          type: "string",
+          enum: ["open", "completed", "all"],
+          default: "open",
+          description: "Which reminders to include (default: open)",
+        },
+        limit: {
+          type: "integer",
+          minimum: 0,
+          default: 0,
+          description: "Max results; 0 = unlimited (default: 0)",
+        },
+      },
+      required: ["query"],
+    },
+    annotations: { title: "Search reminders", ...READ_ONLY },
+  },
+  {
+    name: "get_today",
+    description:
+      "Get all open reminders due today (local time) across every list, with or without a due time.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { title: "Get today's reminders", ...READ_ONLY },
+  },
+  {
+    name: "get_overdue",
+    description:
+      "Get all open reminders whose due date is strictly before today.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { title: "Get overdue reminders", ...READ_ONLY },
+  },
+  {
+    name: "get_scheduled",
+    description:
+      "Get all open reminders that have any due date (today, future, or past).",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { title: "Get scheduled reminders", ...READ_ONLY },
+  },
+  {
+    name: "get_reminder",
+    description: "Fetch a single reminder by its stable EventKit UUID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: REMINDER_ID,
+      },
+      required: ["id"],
+    },
+    annotations: { title: "Get reminder", ...READ_ONLY },
+  },
+  {
+    name: "create_reminder",
+    description:
+      "Create a new reminder in a specified list. Due date must be ISO-8601 local time (e.g. 2026-04-11T18:00:00), a date without a time (e.g. 2026-04-11), or omitted. A due time also sets an alert at that time; a date without a time sets none. Priority is 0 (none), 1 (high), 5 (medium), or 9 (low). `recurrence` makes it repeat and needs a due date.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        list: {
+          type: "string",
+          description: "Target list (must already exist). " + LIST_REFERENCE,
+        },
+        title: { type: "string", description: "Reminder title" },
+        body: {
+          type: "string",
+          description: "Optional notes/body text",
+        },
+        dueDate: {
+          type: "string",
+          description:
+            "Optional due date: ISO-8601 local time like 2026-04-11T18:00:00, or YYYY-MM-DD like 2026-04-11 for a date without a time",
+        },
+        priority: {
+          type: "integer",
+          enum: [0, 1, 5, 9],
+          default: 0,
+          description: "0=none, 1=high, 5=medium, 9=low",
+        },
+        recurrence: RECURRENCE,
+      },
+      required: ["list", "title"],
+    },
+    annotations: { title: "Create reminder", ...ADDITIVE },
+  },
+  {
+    name: "update_reminder",
+    description:
+      "Update an existing reminder by ID. Only provided fields are changed. Use `clearDueDate: true` to explicitly remove a due date (different from omitting `dueDate`). `recurrence` replaces the repeat rule and `clearRecurrence: true` stops the reminder repeating; a repeating reminder keeps needing a due date, so removing the due date of one takes `clearRecurrence: true` as well.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: REMINDER_ID,
+        title: { type: "string", description: "New title" },
+        body: {
+          type: "string",
+          description: "New notes text (replaces the existing notes)",
+        },
+        dueDate: {
+          type: "string",
+          description:
+            "New due date: ISO-8601 local time like 2026-04-11T18:00:00, or YYYY-MM-DD like 2026-04-11 for a date without a time. Replaces the existing alerts; ignored when clearDueDate is true",
+        },
+        clearDueDate: {
+          type: "boolean",
+          description: "If true, explicitly remove the existing due date",
+        },
+        priority: {
+          type: "integer",
+          enum: [0, 1, 5, 9],
+          description: "0=none, 1=high, 5=medium, 9=low",
+        },
+        recurrence: {
+          ...RECURRENCE,
+          description: "New repeat rule; replaces the existing one. " + RECURRENCE.description,
+        },
+        clearRecurrence: {
+          type: "boolean",
+          description: "If true, stop the reminder repeating",
+        },
+      },
+      required: ["id"],
+    },
+    annotations: { title: "Update reminder", ...DESTRUCTIVE_IDEMPOTENT },
+  },
+  {
+    name: "complete_reminder",
+    description:
+      "Mark a reminder as completed by ID. A repeating reminder is not closed: it moves on to its next occurrence and " +
+      "stays open under the same ID with the next due date, and the Reminders store keeps the finished occurrence as a " +
+      "separate completed reminder without the rule. Each call therefore completes one more occurrence. To stop a " +
+      "reminder from repeating, update it with clearRecurrence first.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: REMINDER_ID,
+      },
+      required: ["id"],
+    },
+    annotations: { title: "Complete reminder", ...DESTRUCTIVE },
+  },
+  {
+    name: "uncomplete_reminder",
+    description: "Unmark a completed reminder (set it back to open).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: REMINDER_ID,
+      },
+      required: ["id"],
+    },
+    annotations: { title: "Uncomplete reminder", ...DESTRUCTIVE_IDEMPOTENT },
+  },
+  {
+    name: "delete_reminder",
+    description: "Permanently delete a reminder by ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: REMINDER_ID,
+      },
+      required: ["id"],
+    },
+    annotations: { title: "Delete reminder", ...DESTRUCTIVE_IDEMPOTENT },
+  },
+];
+
+// ---------------------------------------------------------------------------
+// MCP server
+// ---------------------------------------------------------------------------
+
+const server = new Server(
+  { name: "apple-reminders", version: VERSION },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: TOOLS,
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const toolName = request.params.name;
+  const args = request.params.arguments || {};
+
+  // Translate each tool call into the corresponding binary invocation.
+  // Scalar commands pass positional args; create/update pass a JSON payload.
+  try {
+    switch (toolName) {
+      case "get_lists":
+        return envelopeToMcpResult(await runBinary(["list-lists"]));
+
+      case "get_list_info":
+        requireString(args, "list");
+        return envelopeToMcpResult(
+          await runBinary(["get-list-info", args.list])
+        );
+
+      case "list_reminders": {
+        requireString(args, "list");
+        const filter = args.filter || "open";
+        return envelopeToMcpResult(
+          await runBinary(["list-reminders", args.list, filter])
+        );
+      }
+
+      case "search_reminders": {
+        requireString(args, "query");
+        const filter = args.filter || "open";
+        const lim = args.limit ?? 0;
+        if (
+          typeof lim !== "number" ||
+          !Number.isInteger(lim) ||
+          lim < 0
+        ) {
+          const e = new Error("limit must be a non-negative integer");
+          e.envelopeCode = "INVALID_PAYLOAD";
+          throw e;
+        }
+        return envelopeToMcpResult(
+          await runBinary(["search-reminders", args.query, filter, String(lim)])
+        );
+      }
+
+      case "get_today":
+        return envelopeToMcpResult(await runBinary(["get-today"]));
+
+      case "get_overdue":
+        return envelopeToMcpResult(await runBinary(["get-overdue"]));
+
+      case "get_scheduled":
+        return envelopeToMcpResult(await runBinary(["get-scheduled"]));
+
+      case "get_reminder":
+        requireString(args, "id");
+        return envelopeToMcpResult(
+          await runBinary(["get-reminder", args.id])
+        );
+
+      case "create_reminder": {
+        requireString(args, "list");
+        requireString(args, "title");
+        const payload = {
+          list: args.list,
+          title: args.title,
+        };
+        if (typeof args.body === "string") payload.body = args.body;
+        if (typeof args.dueDate === "string") payload.dueDate = args.dueDate;
+        if (typeof args.priority === "number") payload.priority = args.priority;
+        if (args.recurrence != null) payload.recurrence = args.recurrence;
+        // Pass the JSON payload over stdin so user content never appears on
+        // the command line. The Swift binary reads stdin when it sees `-`.
+        return envelopeToMcpResult(
+          await runBinary(["create-reminder", "-"], {
+            stdin: JSON.stringify(payload),
+          })
+        );
+      }
+
+      case "update_reminder": {
+        requireString(args, "id");
+        const payload = { id: args.id };
+        if (typeof args.title === "string") payload.title = args.title;
+        if (typeof args.body === "string") payload.body = args.body;
+        if (typeof args.dueDate === "string") payload.dueDate = args.dueDate;
+        if (args.clearDueDate === true) payload.clearDueDate = true;
+        if (typeof args.priority === "number") payload.priority = args.priority;
+        if (args.recurrence != null) payload.recurrence = args.recurrence;
+        if (args.clearRecurrence === true) payload.clearRecurrence = true;
+        return envelopeToMcpResult(
+          await runBinary(["update-reminder", "-"], {
+            stdin: JSON.stringify(payload),
+          })
+        );
+      }
+
+      case "complete_reminder":
+        requireString(args, "id");
+        return envelopeToMcpResult(
+          await runBinary(["complete-reminder", args.id])
+        );
+
+      case "uncomplete_reminder":
+        requireString(args, "id");
+        return envelopeToMcpResult(
+          await runBinary(["uncomplete-reminder", args.id])
+        );
+
+      case "delete_reminder":
+        requireString(args, "id");
+        return envelopeToMcpResult(
+          await runBinary(["delete-reminder", args.id])
+        );
+
+      default:
+        return {
+          content: [{ type: "text", text: `Unknown tool: ${toolName}` }],
+          isError: true,
+        };
+    }
+  } catch (err) {
+    // Surface wrapper-level failures in the same {status,code,message}
+    // envelope shape that Swift errors use, so MCP clients see one
+    // consistent error contract regardless of where the failure originated.
+    const envelope = {
+      status: "error",
+      code: err && err.envelopeCode ? err.envelopeCode : "WRAPPER_ERROR",
+      message: err instanceof Error ? err.message : String(err),
+    };
+    return envelopeToMcpResult(envelope);
+  }
+});
+
+function requireString(args, key) {
+  if (typeof args[key] !== "string" || args[key].length === 0) {
+    const e = new Error(`Missing required argument: ${key}`);
+    e.envelopeCode = "INVALID_PAYLOAD";
+    throw e;
+  }
+}
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+main().catch((err) => {
+  console.error("Server fatal error:", err);
+  process.exit(1);
+});
